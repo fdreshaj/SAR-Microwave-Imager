@@ -228,3 +228,4 @@ scanner/scanner.py
 scanner/Plugins/motion_controller_plugin.py
 scanner/Plugins/Simplified_VNA_Plugin.py
 scanner/Plugins/motion_controller_plugin.py
+*.zip

@@ -177,7 +177,7 @@ class MainWindow(QMainWindow):
                     self.ui.configure_probe_button.setChecked(False)
                     return
 
-            # Now show the configuration UI
+            
             controller = self.scanner.scanner.probe_controller
             self.set_configuration_settings_probe(controller._probe, controller.is_connected(), self.connect_probe, self.disconnect_probe)
         else:

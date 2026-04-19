@@ -7,7 +7,7 @@ from scanner.probe_controller import ProbePlugin
 from scanner.plugin_setting import PluginSettingString, PluginSettingInteger
 from scanner.motion_controller import MotionControllerPlugin
 import statistics   
-
+import matplotlib.pyplot as plt
 class cyBot_Plugin(ProbePlugin):
     def __init__(self):
         super().__init__()
@@ -148,45 +148,42 @@ class motion_controller_plugin(MotionControllerPlugin):
         except Exception as e:
             print(f"Failed to connect to cyBot: {e}")
             self.cybot = None
-        
     def read_thread_interrupt(self):
-        """
-        Acts as the interrupt handler. Continuously polls the socket
-        and logs data to both console and text file.
-        """
         print(f"Logging started. Saving to {self.log_filename}")
-        
-        # Open file in append mode ('a')
         with open(self.log_filename, "a") as f:
             f.write(f"\n--- Session Started: {datetime.now()} ---\n")
             
             while self.read_thread_cond:
                 try:
-                    
                     data = self.cybot.recv(1024)
+                    if not data: break
                     
-                    if data:
-                        
-                        decoded_data = data.decode('utf-8', errors='ignore').strip()
-                        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                        log_entry = f"[{timestamp}] RX: {decoded_data}"
+                    decoded_data = data.decode('utf-8', errors='ignore').strip()
+                    
+                    # Logic to parse the specific C-formatted string
+                    if "Data:" in decoded_data:
+                        # "Data: Ultrasound 50.0 , IR 1200.0 , Angle 90"
+                        try:
+                            parts = decoded_data.split(",")
+                            u_dist = float(parts[0].split("Ultrasound")[1].strip())
+                            ir_val = float(parts[1].split("IR")[1].strip())
+                            angle = int(parts[2].split("Angle")[1].strip())
+                            
+                            print(f"Parsed: Angle {angle} -> Dist: {u_dist}")
+                        except Exception as parse_err:
+                            print(f"Parse error: {parse_err}")
 
-                        print(log_entry)
-                        
-                        f.write(log_entry + "\n")
-                        f.flush()
-                    else:
-                       
-                        break
+                    
+                    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    log_entry = f"[{timestamp}] RX: {decoded_data}"
+                    f.write(log_entry + "\n")
+                    f.flush()
 
                 except socket.timeout:
                     continue 
                 except Exception as e:
-                    if self.read_thread_cond:
-                        print(f"Read Error: {e}")
-                    break
-                    
-        print("Logging thread stopped.")
+                    break   
+    
 
     def disconnect(self):
         self.read_thread_cond = False
@@ -262,9 +259,9 @@ class motion_controller_plugin(MotionControllerPlugin):
             if prefix == 'mf':
                 command_buffer_2 = '00'+raw_value_str
             if prefix == 'mb':
-                command_buffer_2 = '01'+raw_value_str
+                command_buffer_2 = '01'+raw_value_str 
             if prefix == 'r':
-                command_buffer_2 = "10"+raw_value_str
+                command_buffer_2 = "10"+raw_value_str 
                 
             print(f"sending this command: {command_buffer_2}")
             self.send_gcode_command(command_buffer_2)
@@ -302,11 +299,174 @@ class motion_controller_plugin(MotionControllerPlugin):
             self.cybot.send((command + "\n").encode('utf-8'))
     def emergency_stop(self):
         pass
+    
+    
 
+    def ir_to_cm(self, raw_adc):
+   
+        if raw_adc <= 0:
+            return 80.0
+
+        voltage = raw_adc * (3.3 / 4095.0)  
+
+    
+        if voltage < 0.4:
+            return 80.0
+
+        distance_cm = (1 / voltage) - 0.42
+
+       
+        return max(0.0, min(distance_cm, 80.0))
     def home(self, axes=None):
-        ## Currently being used as a scan button.
+            prefix = "11"
+            angles = []
+            avg_ir_raw = []
+            avg_distance_cm = []
+            
+            print("Starting Scan")
+            
+            for i in range(0, 181, 10): 
+                command = f"{prefix}{i:03d}" 
+                print(f"Moving to angle: {i}")
+                self.send_gcode_command(command)
+                
+                
+                time.sleep(0.7) 
+                
+                raw_samples = []
+                cm_samples = []
+
+                # Collect 5 measurements
+                while len(raw_samples) < 5:
+                    raw_val = self.get_latest_ir_from_log()
+                    if raw_val is not None:
+                        raw_samples.append(raw_val)
+                        cm_samples.append(self.ir_to_cm(raw_val))
+                    time.sleep(0.1) 
+
+                
+                mean_raw = sum(raw_samples) / 5
+                mean_cm = sum(cm_samples) / 5
+                
+                angles.append(i)
+                avg_ir_raw.append(mean_raw)
+                avg_distance_cm.append(mean_cm)
+                
+                print(f"Angle {i} -> Raw: {mean_raw:.1f}, Dist: {mean_cm:.2f} cm")
+
+            self.plot_scan_results(angles, avg_ir_raw)
+            self.plot_distance_results(angles, avg_distance_cm)
+            obj = self.analyze_data(angles, avg_distance_cm)
+            self.smallest_obj(obj)
+            
+            
+    def analyze_data(self, angles, avg_distance_cm):
         
-        prefix = "h"
+        objects = []
+        thresh = 50.0  
+        object_indices = [] 
+
+        for i in range(len(avg_distance_cm)):
+            if avg_distance_cm[i] < thresh:
+                object_indices.append(i)
+            else:
+                if len(object_indices) > 0:
+                    objects.append(self._create_object_dict(object_indices, angles, avg_distance_cm))
+                    object_indices = []
+
+        if len(object_indices) > 0:
+            objects.append(self._create_object_dict(object_indices, angles, avg_distance_cm))
+
+        return objects
+
+    def _create_object_dict(self, indices, angles, dists):
+        import math
+        """Helper to package the object data into a dictionary."""
+        start_angle = angles[indices[0]]
+        end_angle = angles[indices[-1]]
+        center = (start_angle + end_angle) / 2
         
-        self.send_gcode_command(prefix)
+        # Width in degrees
+        width_deg = end_angle - start_angle
+        if width_deg == 0: width_deg = 2 
         
+        avg_dist = sum(dists[i] for i in indices) / len(indices)
+        linear_width = (avg_dist * math.pi * width_deg) / 180
+        
+        obj = {
+            "center": center,
+            "l_width": linear_width,
+            "distance": min(dists[i] for i in indices)
+        }
+        print(f"Detected Object: Angle {center}°, Linear Width {linear_width:.2f}cm, Dist {obj['distance']:.2f}cm")
+        return obj
+
+    def smallest_obj(self, objects):
+        # Always check if objects were found before using min()
+        if not objects:
+            print("No objects found to move to.")
+            return
+
+       
+        smob = min(objects, key=lambda x: x['l_width'])
+        
+        tarang = int(smob['center'])
+        tardist = int(max(0, smob['distance'] - 6)) # Move to dist minus 6cm
+        
+        print(f"Navigating to Pillar: {tarang} deg, {tardist} cm")
+        self.send_gcode_command(f"10{tarang:03d}") # Rotate
+        time.sleep(1.5)
+        self.send_gcode_command(f"00{tardist:03d}") # Move Forward
+    def smallest_obj(self, objects):
+        if not objects:
+            print("No objects found to move to.")
+            return
+
+        smob = min(objects, key=lambda x: x['l_width'])
+        
+        tarang = int(smob['center'])
+        tardist = int(max(0, smob['distance'] - 6))
+        
+        print(f"Navigating to Pillar: {tarang} deg, {tardist} cm")
+        self.send_gcode_command(f"10{tarang:03d}")   # Rotate
+        time.sleep(1.5)
+        self.send_gcode_command(f"00{tardist:03d}")  # Move Forward
+            
+            
+    def plot_scan_results(self, angles, ir_values):
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(angles, ir_values, marker='o', linestyle='-', color='b', label='Raw ADC')
+        plt.title('CyBot Scan: Angle vs. Average IR Value (Raw)')
+        plt.xlabel('Angle (Degrees)')
+        plt.ylabel('Average IR Value (Raw/Filtered)')
+        plt.grid(True, linestyle='--')
+        
+        plot_path = "scan_plot_raw.png"
+        plt.savefig(plot_path)
+        print(f"Raw plot saved to {plot_path}")
+        plt.show()
+
+    def plot_distance_results(self, angles, cm_values):
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(angles, cm_values, marker='s', linestyle='--', color='r', label='Distance (cm)')
+        plt.title('CyBot Scan: Angle vs. Distance (cm)')
+        plt.xlabel('Angle (Degrees)')
+        plt.ylabel('Distance (cm)')
+        plt.grid(True, linestyle='--')
+        
+        plot_path = "scan_plot_cm.png"
+        plt.savefig(plot_path)
+        print(f"Distance plot saved to {plot_path}")
+        plt.show()
+        
+    def get_latest_ir_from_log(self):
+        
+        try:
+            with open(self.log_filename, "r") as f:
+                lines = f.readlines()
+                for line in reversed(lines):
+                    if "IR" in line:
+                        return float(line.split("IR")[1].split(",")[0].strip())
+        except: return None
