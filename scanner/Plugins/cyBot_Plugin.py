@@ -9,6 +9,7 @@ from scanner.motion_controller import MotionControllerPlugin
 import statistics   
 import matplotlib.pyplot as plt
 import math
+
 class cyBot_Plugin(ProbePlugin):
     def __init__(self):
         super().__init__()
@@ -267,13 +268,13 @@ class motion_controller_plugin(MotionControllerPlugin):
            
             command_buffer = f"{prefix}{raw_value}"
             if prefix == 'mf':
-                command_buffer_2 = '00'+raw_value_str
+                command_buffer_2 = '000'+raw_value_str
             if prefix == 'mb':
-                command_buffer_2 = '01'+raw_value_str 
+                command_buffer_2 = '010'+raw_value_str 
             if prefix == 'rl':
-                command_buffer_2 = "10"+raw_value_str 
+                command_buffer_2 = "100"+raw_value_str 
             if prefix == 'rr':
-                command_buffer_2 = "11" + raw_value_str
+                command_buffer_2 = "110" + raw_value_str
                 
             print(f"sending this command: {command_buffer_2}")
             self.send_gcode_command(command_buffer_2)
@@ -379,33 +380,32 @@ class motion_controller_plugin(MotionControllerPlugin):
         after each segment before proceeding.
         """
         # 1. Handle Rotation
-        self.ok_received.clear()
+        #self.ok_received.clear()
         target_angle = int(angle_deg)
-        self.send_gcode_command(f"10{target_angle:03d}")
-        
+        self.send_gcode_command(f"100{target_angle:03d}")
+        time.sleep(1)
         # Wait for rotation to finish
-        print(f"Waiting for OK after rotating to {target_angle}...")
-        self.ok_received.wait(timeout=5.0) 
+        #print(f"Waiting for OK after rotating to {target_angle}...")
+        # self.ok_received.wait(timeout=5.0) 
 
         # 2. Incremental Movement
         remaining_dist = radius
         step_size = 100.0
-
-        while remaining_dist > 0:
-            current_step = min(remaining_dist, step_size)
-            
+        inc = radius/step_size
+        for i in range(0,int(radius),int(step_size)):
+            time.sleep(1)
             # Reset flag and send move command
-            self.ok_received.clear()
-            command = f"00{int(current_step):03d}"
-            print(f"Moving {current_step}mm... Waiting for robot OK.")
+            # self.ok_received.clear()
+            command = f"000{int(step_size):03d}"
+            # print(f"Moving {current_step}mm... Waiting for robot OK.")
             self.send_gcode_command(command)
+            time.sleep(1)
 
+            # TODO: Busy wait loop when moving
+            # if not self.ok_received.wait(timeout=10.0):
+            #     print("Error: Timed out waiting for OK from robot. Potential collision or loss of signal.")
+            #     break
 
-            if not self.ok_received.wait(timeout=10.0):
-                print("Error: Timed out waiting for OK from robot. Potential collision or loss of signal.")
-                break
-
-            remaining_dist -= current_step
 
         print("Trajectory sequence finished.")
     
@@ -461,7 +461,9 @@ class motion_controller_plugin(MotionControllerPlugin):
     def home(self, axes=None):
         
         
-        pass
+        self.execute_trajectory(500,180)
+        time.sleep(1)
+        self.execute_trajectory(500,180)
             # prefix = "11"
             # angles = []
             # avg_ir_raw = []
@@ -561,6 +563,7 @@ class motion_controller_plugin(MotionControllerPlugin):
         self.send_gcode_command(f"10{tarang:03d}") # Rotate
         time.sleep(1.5)
         self.send_gcode_command(f"00{tardist:03d}") # Move Forward
+        
     def smallest_obj(self, objects):
         if not objects:
             print("No objects found to move to.")
