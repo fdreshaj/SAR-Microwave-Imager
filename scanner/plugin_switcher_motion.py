@@ -129,6 +129,8 @@ class PluginSwitcherMotion(MotionControllerPlugin):
     def home(self, axes: list[int]) -> dict[int, float]:
         pass
 
+    def  show_radar(self):
+        pass
     
     def get_current_positions(self) -> tuple[float, ...]:
         pass

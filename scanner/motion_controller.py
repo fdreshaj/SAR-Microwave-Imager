@@ -67,6 +67,9 @@ class MotionControllerPlugin(ABC):
     @abstractmethod
     def emergency_stop(self):
         pass
+    @abstractmethod
+    def show_radar(self):
+        pass
 
 class MotionController:
     _axis_labels: tuple[str, ...]
@@ -97,7 +100,12 @@ class MotionController:
         self._driver.set_velocity()
         self._driver.set_acceleration()
         
-    
+    def show_radar(self):
+        """Passes the show_radar call to the active plugin driver."""
+        if hasattr(self._driver, 'show_radar'):
+            self._driver.show_radar()
+        else:
+            print("The current plugin does not support a radar view.")
     def is_connected(self) -> bool:
         return self._is_driver_connected
     
