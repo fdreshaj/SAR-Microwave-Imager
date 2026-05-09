@@ -12,7 +12,7 @@ from matplotlib.figure import Figure
 
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QTextEdit, QSizePolicy, QPushButton,
-    QLineEdit, QLabel, QFrame
+    QLineEdit, QLabel, QFrame, QWidget
 )
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QTextCursor
@@ -20,27 +20,18 @@ from PySide6.QtGui import QTextCursor
 from scanner.plugin_setting import PluginSettingString, PluginSettingInteger
 from scanner.motion_controller import MotionControllerPlugin
 
-# Robot circle radius in cm — objects use this same size
 ROBOT_R = 10
 
 
-# ---------------------------------------------------------------------------
-# SIGNAL BRIDGE
-# ---------------------------------------------------------------------------
 class CyBotSignals(QObject):
-    log_signal      = Signal(str, str)      # (message, level)
-    radar_signal    = Signal(float, float)  # (angle_deg, dist_cm)
-    objects_signal  = Signal(list)          # list of parsed object dicts
-    position_signal = Signal(float)         # heading degrees
-    moved_signal    = Signal(float)         # distance cm
+    log_signal      = Signal(str, str)
+    radar_signal    = Signal(float, float)
+    objects_signal  = Signal(list)
+    position_signal = Signal(float)
+    moved_signal    = Signal(float)
+    hazard_signal   = Signal(str)
 
 
-# ---------------------------------------------------------------------------
-# UART OBJECT PARSER
-# Handles:
-#   "Object 1: center=47.0 deg, PING=30.5 cm, linear=5.2 cm, IR=767"
-#   compact table rows: "1  47.0  30.5  94  5.2  767  0  94"
-# ---------------------------------------------------------------------------
 class ObjectParser:
     OBJECT_LINE_RE = re.compile(
         r'Object\s+(\d+):\s*center=([0-9.]+)\s*deg,\s*PING=([0-9.]+)\s*cm,'
@@ -71,47 +62,72 @@ class ObjectParser:
                 'ir':           int(m.group(6)),
             }
         return None
+class AspectRatioWidget(QWidget):
+    """Wraps a widget and enforces a fixed aspect ratio, centering with letterboxing."""
+    def __init__(self, widget, ratio_w: float, ratio_h: float, parent=None):
+        super().__init__(parent)
+        self._widget = widget
+        self._ratio_w = ratio_w
+        self._ratio_h = ratio_h
+        self._widget.setParent(self)
+        #self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        w = self.width()
+        h = self.height()
+        if w == 0 or h == 0:
+            return
+        if w / h > self._ratio_w / self._ratio_h:
+            # container is too wide — constrain by height
+            new_h = h
+            new_w = int(h * self._ratio_w / self._ratio_h)
+        else:
+            # container is too tall — constrain by width
+            new_w = w
+            new_h = int(w * self._ratio_h / self._ratio_w)
+        x = (w - new_w) // 2
+        y = (h - new_h) // 2
+        self._widget.setGeometry(x, y, new_w, new_h)
 
-# ---------------------------------------------------------------------------
-# CARTESIAN MINIMAP
-# ---------------------------------------------------------------------------
 class MinimapWidget(FigureCanvas):
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(6, 6), facecolor='#0a0a0a')
         super().__init__(self.fig)
         self.setParent(parent)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        #self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # MinimapWidget and RadarWidget — replace the existing setSizePolicy line
+        #self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(left=0.1, right=0.97, top=0.93, bottom=0.08)
-
-        # Robot state
+        self._last_move_cm: float = 0.0
         self.x       = 0.0
         self.y       = 0.0
-        self.heading = 90.0   # degrees — 90 = pointing up at start
+        self.heading = 90.0
         self.path    = [(0.0, 0.0)]
 
-        # Detected objects in world coords.
-        # Each: { 'gx', 'gy', 'linear_width', 'distance', 'center', 'index', 'ir' }
         self.world_objects: list[dict] = []
+        self.hazard_objects: list[dict] = []
 
-        # Zoom state: separate X/Y half-spans, only ever grow until clear_objects().
-        # Default: 100 cm half-width (200 cm total) x 200 cm half-height (400 cm total)
         self._view_half_x: float = 100.0
         self._view_half_y: float = 200.0
 
-        # User-defined target position (None = not set)
         self.target: tuple | None = None
 
-        self._draw()
+        self._place_mode: bool = False
+        self.mpl_connect('button_press_event', self._on_canvas_click)
 
-    # ---- public update methods --------------------------------------------
+        self._draw()
 
     def update_heading(self, angle_deg: float):
         self.heading = angle_deg
         self._draw()
+    def hasHeightForWidth(self):
+        return True
 
+    def heightForWidth(self, width: int) -> int:
+        return width
     def move_robot(self, dist_cm: float):
         rad     = math.radians(self.heading)
         self.x += dist_cm * math.cos(rad)
@@ -120,28 +136,14 @@ class MinimapWidget(FigureCanvas):
         self._draw()
 
     def add_objects(self, objects: list):
-        """
-        Convert each object from robot-local polar -> global Cartesian.
-
-        Servo geometry: 90° = straight ahead.
-          offset     = servo_center - 90        range: -90 to +90
-          global_deg = robot_heading + offset
-          gx         = robot_x + dist * cos(global_rad)
-          gy         = robot_y + dist * sin(global_rad)
-
-        If PING=0.0 the sensor didn't fire — use a fallback of 30 cm so
-        the object still appears in front of the robot rather than on top of it.
-        """
         for obj in objects:
             raw_dist   = obj.get('distance', 0.0)
-            dist       = raw_dist if raw_dist > 1.0 else 30.0   # fallback for PING=0
+            dist       = raw_dist if raw_dist > 1.0 else 30.0
 
-            offset_deg = obj['center'] - 90.0   # servo 0=right, 90=fwd, 180=left
+            offset_deg = obj['center'] - 90.0
             global_rad = math.radians(self.heading + offset_deg)
 
             raw_lw = obj.get('linear_width', obj.get('l_width', 0.0))
-            # linear_width is the half-circumference: lw = pi * r => r = lw / pi
-            # Fall back to ROBOT_R when width is missing/zero so objects remain visible
             lw = raw_lw if raw_lw > 0.0 else math.pi * ROBOT_R
             radius = lw / math.pi
             center_dist = dist + radius
@@ -165,15 +167,13 @@ class MinimapWidget(FigureCanvas):
         self._draw()
 
     def clear_objects(self):
-        """Wipe all detected objects and reset zoom to fit current path only."""
         self.world_objects = []
-        # Reset zoom to default viewport
+        self.hazard_objects = []
         self._view_half_x = 100.0
         self._view_half_y = 200.0
         self._draw()
 
     def set_target(self, x: float, y: float):
-        """Set (or update) the blue target marker on the minimap."""
         self.target = (x, y)
         self._draw()
 
@@ -181,7 +181,26 @@ class MinimapWidget(FigureCanvas):
         self.target = None
         self._draw()
 
-    # ---- internal draw ----------------------------------------------------
+    def add_hazard(self, kind: str):
+        dist = ROBOT_R * 2.0
+        fwd_rad = math.radians(self.heading)
+        gx = self.x + dist * math.cos(fwd_rad)
+        gy = self.y + dist * math.sin(fwd_rad)
+        self.hazard_objects.append({'gx': gx, 'gy': gy, 'kind': kind})
+        self._draw()
+
+    def set_place_mode(self, active: bool):
+        self._place_mode = active
+        from PySide6.QtCore import Qt
+        self.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
+
+    def _on_canvas_click(self, event):
+        if not self._place_mode or event.inaxes is None:
+            return
+        self.x = event.xdata
+        self.y = event.ydata
+        self.path.append((self.x, self.y))
+        self._draw()
 
     def _draw(self):
         ax = self.ax
@@ -192,18 +211,15 @@ class MinimapWidget(FigureCanvas):
         for spine in ax.spines.values():
             spine.set_color('#1a3a1a')
         ax.grid(True, color='#1a3a1a', linewidth=0.5, linestyle='--')
-        # Asymmetric viewport: do not force equal aspect
         ax.set_title('Robot Minimap', color='#00ff41', fontsize=10, pad=6)
         ax.set_xlabel('X (cm)', color='#336633', fontsize=8)
         ax.set_ylabel('Y (cm)', color='#336633', fontsize=8)
 
-        # Origin crosshair
         ax.axhline(0, color='#1a3a1a', linewidth=0.8, linestyle=':')
         ax.axvline(0, color='#1a3a1a', linewidth=0.8, linestyle=':')
         ax.plot(0, 0, marker='+', color='#336633',
                 markersize=10, markeredgewidth=1, zorder=2)
 
-        # Breadcrumb path
         if len(self.path) > 1:
             px, py = zip(*self.path)
             ax.plot(px, py, color='#336633', linewidth=1.2,
@@ -212,22 +228,18 @@ class MinimapWidget(FigureCanvas):
                        c='#336633', s=18, zorder=4,
                        edgecolors='none', alpha=0.7)
 
-        # Start marker
         ax.plot(self.path[0][0], self.path[0][1],
                 marker='o', color='#00aaff', markersize=8,
                 markeredgecolor='white', markeredgewidth=0.8,
                 zorder=5, label='Start')
 
-        # ---- Detected objects — red circles, same radius as the robot ----
         for obj in self.world_objects:
             gx, gy = obj['gx'], obj['gy']
 
-            # Dashed line from robot to object
             ax.plot([self.x, gx], [self.y, gy],
                     color='#660000', linewidth=0.8,
                     linestyle=':', zorder=6)
 
-            # Radius derived from linear_width as half-circumference: r = lw / pi
             circle_r = obj['radius']
             obj_circle = plt.Circle(
                 (gx, gy), circle_r,
@@ -236,7 +248,6 @@ class MinimapWidget(FigureCanvas):
             )
             ax.add_patch(obj_circle)
 
-            # Label: mark estimated values with *
             dist_label  = f"~30cm*" if obj['ping_zero']  else f"{obj['distance']:.0f}cm"
             width_label = f"~{obj['linear_width']:.1f}cm*" if obj['width_zero'] else f"{obj['linear_width']:.1f}cm"
             ax.text(
@@ -248,7 +259,24 @@ class MinimapWidget(FigureCanvas):
                           edgecolor='#660000', alpha=0.85)
             )
 
-        # ---- Target marker ----
+        for hz in self.hazard_objects:
+            hx, hy = hz['gx'], hz['gy']
+            if hz['kind'] == 'bump':
+                color, label = '#aa00ff', 'BUMP'
+            else:
+                color, label = '#222222', 'CLIFF'
+            hz_circle = plt.Circle(
+                (hx, hy), ROBOT_R,
+                facecolor=color, edgecolor='white',
+                linewidth=1.2, alpha=0.85, zorder=7
+            )
+            ax.add_patch(hz_circle)
+            ax.text(
+                hx, hy, label,
+                color='white', fontsize=5, fontweight='bold',
+                ha='center', va='center', zorder=8
+            )
+
         if self.target is not None:
             tx, ty = self.target
             target_circle = plt.Circle(
@@ -269,11 +297,9 @@ class MinimapWidget(FigureCanvas):
                 bbox=dict(boxstyle='round,pad=0.2', facecolor='#00001a',
                           edgecolor='#003388', alpha=0.85)
             )
-            # Expand view to include target if needed
             self._view_half_x = max(self._view_half_x, abs(tx - self.x) + ROBOT_R * 2)
             self._view_half_y = max(self._view_half_y, abs(ty - self.y) + ROBOT_R * 2)
 
-        # ---- Robot body ----
         robot_circle = plt.Circle(
             (self.x, self.y), ROBOT_R,
             facecolor='#0d2b0d', edgecolor='#00ff41',
@@ -281,7 +307,6 @@ class MinimapWidget(FigureCanvas):
         )
         ax.add_patch(robot_circle)
 
-        # Heading arrow inside robot circle
         rad = math.radians(self.heading)
         tx  = self.x + ROBOT_R * 0.82 * math.cos(rad)
         ty  = self.y + ROBOT_R * 0.82 * math.sin(rad)
@@ -292,7 +317,6 @@ class MinimapWidget(FigureCanvas):
             zorder=11
         )
 
-        # Position / heading label
         ax.text(
             self.x + ROBOT_R + 2, self.y + ROBOT_R + 2,
             f"({self.x:.1f}, {self.y:.1f})\n{self.heading:.0f}°",
@@ -301,7 +325,6 @@ class MinimapWidget(FigureCanvas):
                       edgecolor='#1a3a1a', alpha=0.8)
         )
 
-        # Legend
         legend_handles = [
             mpatches.Patch(color='#00aaff', label='Start'),
             mpatches.Patch(color='#336633', label='Path'),
@@ -312,6 +335,12 @@ class MinimapWidget(FigureCanvas):
                 mpatches.Patch(color='red',
                                label=f'Objects ({len(self.world_objects)})  * = PING fallback')
             )
+        bump_count  = sum(1 for h in self.hazard_objects if h['kind'] == 'bump')
+        cliff_count = sum(1 for h in self.hazard_objects if h['kind'] == 'cliff')
+        if bump_count:
+            legend_handles.append(mpatches.Patch(color='#aa00ff', label=f'Bump ({bump_count})'))
+        if cliff_count:
+            legend_handles.append(mpatches.Patch(color='#222222', label=f'Cliff ({cliff_count})'))
         if self.target is not None:
             legend_handles.append(
                 mpatches.Patch(color='#0088ff', label=f'Target ({self.target[0]:.1f}, {self.target[1]:.1f})')
@@ -319,29 +348,25 @@ class MinimapWidget(FigureCanvas):
         ax.legend(handles=legend_handles, loc='upper right', fontsize=6,
                   facecolor='#0a0a0a', edgecolor='#1a3a1a', labelcolor='#00ff41')
 
-        # --- View: asymmetric — 200 cm wide x 400 cm tall, ratchets outward ---
         pad = ROBOT_R * 2.0
         for obj in self.world_objects:
             r = obj['radius']
             self._view_half_x = max(self._view_half_x, abs(obj['gx'] - self.x) + r + pad)
             self._view_half_y = max(self._view_half_y, abs(obj['gy'] - self.y) + r + pad)
 
-        # Robot is always the center of the view
         ax.set_xlim(self.x - self._view_half_x, self.x + self._view_half_x)
         ax.set_ylim(self.y - self._view_half_y, self.y + self._view_half_y)
 
         self.draw()
 
 
-# ---------------------------------------------------------------------------
-# POLAR RADAR
-# ---------------------------------------------------------------------------
 class RadarWidget(FigureCanvas):
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(4, 3), facecolor='#0a0a0a')
         super().__init__(self.fig)
         self.setParent(parent)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # MinimapWidget and RadarWidget — replace the existing setSizePolicy line
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.ax = self.fig.add_subplot(111, polar=True)
         self.fig.subplots_adjust(left=0.05, right=0.95, top=0.90, bottom=0.05)
@@ -375,6 +400,11 @@ class RadarWidget(FigureCanvas):
             labels=['25', '50', '75', '100'],
             color='#336633', fontsize=5
         )
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return int(width * 3 / 4)
 
     def add_point(self, angle_deg: float, dist_cm: float):
         self._current_angle = angle_deg
@@ -432,9 +462,6 @@ class RadarWidget(FigureCanvas):
         self.draw()
 
 
-# ---------------------------------------------------------------------------
-# UART CONSOLE
-# ---------------------------------------------------------------------------
 class UARTConsole(QTextEdit):
     COLORS = {
         'info': '#00ff41',
@@ -468,13 +495,10 @@ class UARTConsole(QTextEdit):
         self.setTextCursor(cursor)
 
 
-# ---------------------------------------------------------------------------
-# COMMAND CENTER DIALOG
-# ---------------------------------------------------------------------------
 class CommandCenterDialog(QDialog):
     def __init__(self, signals: CyBotSignals, plugin=None, parent=None):
         super().__init__(parent)
-        self._plugin = plugin  # reference back so buttons can call plugin methods
+        self._plugin = plugin
         self.setWindowTitle("CyBot Command Center")
         self.resize(1100, 620)
         self.setStyleSheet("background-color: #050505;")
@@ -482,6 +506,7 @@ class CommandCenterDialog(QDialog):
         signals.log_signal.connect(self._on_log)
         signals.radar_signal.connect(self._on_radar)
         signals.objects_signal.connect(self._on_objects)
+        signals.hazard_signal.connect(self._on_hazard)
         signals.position_signal.connect(self._on_heading)
         signals.moved_signal.connect(self._on_moved)
 
@@ -489,12 +514,13 @@ class CommandCenterDialog(QDialog):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
-        # Left: Minimap (main focus) + clear button below it
         left_col = QVBoxLayout()
         left_col.setSpacing(4)
 
+        
         self.minimap = MinimapWidget(self)
-        left_col.addWidget(self.minimap, stretch=1)
+        self._minimap_wrap = AspectRatioWidget(self.minimap, 1, 1, self)
+        left_col.addWidget(self._minimap_wrap, stretch=1)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
@@ -517,20 +543,49 @@ class CommandCenterDialog(QDialog):
         self.clear_btn.clicked.connect(self._on_clear_objects)
         btn_row.addWidget(self.clear_btn)
 
+        self.place_btn = QPushButton("Move Bot")
+        self.place_btn.setFixedHeight(28)
+        self.place_btn.setCheckable(True)
+        self._place_btn_style_off = """
+            QPushButton {
+                background-color: #0a0a0a;
+                color: #ffaa00;
+                border: 1px solid #664400;
+                border-radius: 3px;
+                font-family: 'Courier New', monospace;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #1a1000; border-color: #ffaa00; }
+        """
+        self._place_btn_style_on = """
+            QPushButton {
+                background-color: #332200;
+                color: #ffdd00;
+                border: 2px solid #ffaa00;
+                border-radius: 3px;
+                font-family: 'Courier New', monospace;
+                font-size: 10px;
+                font-weight: bold;
+            }
+        """
+        self.place_btn.setStyleSheet(self._place_btn_style_off)
+        self.place_btn.toggled.connect(self._on_place_mode_toggled)
+        btn_row.addWidget(self.place_btn)
 
         left_col.addLayout(btn_row)
-
         root.addLayout(left_col, stretch=2)
 
-        # Right: Radar + Console
         right_col = QVBoxLayout()
         right_col.setSpacing(4)
 
+        # self.radar = RadarWidget(self)
+        # self.radar.setMinimumHeight(280)
+        # right_col.addWidget(self.radar, stretch=1)
         self.radar = RadarWidget(self)
-        self.radar.setMinimumHeight(280)
-        right_col.addWidget(self.radar, stretch=1)
+        self._radar_wrap = AspectRatioWidget(self.radar, 4, 3, self)
+        right_col.addWidget(self._radar_wrap, stretch=1)
 
-        # Target coordinate input panel
         target_frame = QFrame(self)
         target_frame.setStyleSheet("""
             QFrame {
@@ -651,6 +706,22 @@ class CommandCenterDialog(QDialog):
     def _on_clear_target(self):
         self.minimap.clear_target()
 
+    def _on_place_mode_toggled(self, checked: bool):
+        self.minimap.set_place_mode(checked)
+        if checked:
+            self.place_btn.setStyleSheet(self._place_btn_style_on)
+            self.place_btn.setText("Move Bot: ON")
+            self.console.append_message("Place mode ON — click minimap to teleport robot", 'warn')
+        else:
+            self.place_btn.setStyleSheet(self._place_btn_style_off)
+            self.place_btn.setText("Move Bot")
+            self.console.append_message("Place mode OFF", 'info')
+
+    def _on_hazard(self, kind: str):
+        self.minimap.add_hazard(kind)
+        label = 'BUMP FOUND' if kind == 'bump' else 'CLIFF FOUND'
+        self.console.append_message(f"{label} — marked on minimap", 'warn')
+
     def _on_clear_objects(self):
         self.minimap.clear_objects()
         self.radar.clear_scan()
@@ -659,9 +730,6 @@ class CommandCenterDialog(QDialog):
         self.console.append_message("Objects cleared", 'warn')
 
 
-# ---------------------------------------------------------------------------
-# MOTION PLUGIN
-# ---------------------------------------------------------------------------
 class motion_controller_plugin(MotionControllerPlugin):
     def __init__(self):
         super().__init__()
@@ -679,31 +747,24 @@ class motion_controller_plugin(MotionControllerPlugin):
         self.log_filename     = "cybot_data_log.txt"
         self.ok_received      = threading.Event()
 
-        # Completion events set by _parse_line when bot confirms each action
         self.turn_finished = threading.Event()
         self.move_finished = threading.Event()
 
-        # Ordered history of (opcode, value_cm_or_deg) from move_absolute
-        # Used by return_to_start to replay the path in reverse
         self._command_history: list[tuple[str, int]] = []
 
         self.signals        = CyBotSignals()
         self.command_center = CommandCenterDialog(self.signals, plugin=self)
 
-        # Raw sweep buffers
         self._scan_angles: list[float] = []
         self._scan_dists:  list[float] = []
 
-        # Multi-line object table assembly buffer
         self._pending_objects: list[dict] = []
         self._in_object_block = False
 
     def clear_pending_objects(self):
-        """Reset object buffers — called by the Clear Objects button."""
         self._pending_objects = []
         self._in_object_block = False
 
-    # ------------------------------------------------------------------
     def connect(self):
         try:
             self.cybot = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -722,10 +783,8 @@ class motion_controller_plugin(MotionControllerPlugin):
             print(f"Failed to connect: {e}")
             self.cybot = None
 
-    # ------------------------------------------------------------------
     def read_thread_interrupt(self):
         self.signals.log_signal.emit(f"Logging to {self.log_filename}", 'info')
-        # Accumulate partial TCP chunks until we have complete \n-terminated lines
         recv_buf = ""
         with open(self.log_filename, "a") as f:
             f.write(f"\n--- Session Started: {datetime.now()} ---\n")
@@ -737,8 +796,6 @@ class motion_controller_plugin(MotionControllerPlugin):
 
                     recv_buf += data.decode('utf-8', errors='ignore')
 
-                    # Process every complete line; leave any incomplete
-                    # fragment in recv_buf for the next recv() call
                     while '\n' in recv_buf:
                         line, recv_buf = recv_buf.split('\n', 1)
                         decoded = line.strip()
@@ -757,17 +814,13 @@ class motion_controller_plugin(MotionControllerPlugin):
                 except Exception:
                     break
 
-    # ------------------------------------------------------------------
     def _parse_line(self, decoded: str):
-        # Status flags
         if "OK" in decoded:
             self.ok_received.set()
             self.signals.log_signal.emit("Robot: path clear", 'info')
         elif "CORRECTION" in decoded:
             self.signals.log_signal.emit("Robot: course correction", 'warn')
 
-        # Raw sweep point (Pass 1): "center=19.0 deg, PING=30.0 cm"
-        # Exclude Pass-2 "Object N:" lines which also contain "center="
         if "center=" in decoded and "PING=" in decoded and "Object" not in decoded:
             try:
                 angle_val = float(decoded.split("center=")[1].split(" deg")[0])
@@ -781,7 +834,6 @@ class motion_controller_plugin(MotionControllerPlugin):
             except:
                 pass
 
-        # Pass-2 object line: "Object 1: center=47.0 deg, PING=0.0 cm, ..."
         parsed = ObjectParser.parse(decoded)
         if parsed:
             self._pending_objects.append({
@@ -801,17 +853,14 @@ class motion_controller_plugin(MotionControllerPlugin):
                 'warn'
             )
 
-        # Table header marks start of object block
         if "Detected Objects" in decoded:
             self._in_object_block = True
 
-        # Closing separator — flush all buffered objects at once
         if self._in_object_block and "===" in decoded and self._pending_objects:
             self.signals.objects_signal.emit(list(self._pending_objects))
             self._pending_objects  = []
             self._in_object_block  = False
 
-        # Heading: "Angle 90"
         if "Angle" in decoded and "center=" not in decoded:
             try:
                 angle = float(decoded.split("Angle")[1].strip().split()[0])
@@ -819,13 +868,34 @@ class motion_controller_plugin(MotionControllerPlugin):
             except:
                 pass
 
-        # Completion acknowledgements from the bot
+        # ---- UPDATED: hazard events with early-stop position correction ----
+        # The bot sends "BUMP FOUND at 45" or "CLIFF FOUND at 45" when it stops
+        # mid-move. The distance is how far it actually travelled. We emit
+        # moved_signal first to correct self.x/y, then hazard_signal places
+        # the marker one robot-length ahead of the corrected position.
+        upper = decoded.upper()
+        for hazard_kind, keyword in (('bump', 'BUMP FOUND'), ('cliff', 'CLIFF FOUND')):
+            if keyword in upper:
+                try:
+                    dist_traveled_mm = float(decoded.split('at')[1].strip().split()[0])
+                    # Step 1: rewind to the position before the move was issued
+                    self.signals.moved_signal.emit(-self._last_move_cm)
+                    # Step 2: advance by the distance the bot actually covered
+                    self.signals.moved_signal.emit(dist_traveled_mm / 10.0)
+                    self.signals.log_signal.emit(
+                        f"Hazard early-stop: rewound {self._last_move_cm:.1f}cm, "
+                        f"re-applied {dist_traveled_mm:.1f}mm", 'warn'
+                    )
+                except (IndexError, ValueError):
+                    pass  # No distance in message — position already correct
+                self.signals.hazard_signal.emit(hazard_kind)
+        # ---- end update ----
+
         if "Turn Finished" in decoded:
             self.turn_finished.set()
         if "Movement Finished" in decoded:
             self.move_finished.set()
 
-        # Movement: "Moved 10 cm"
         if "Moved" in decoded:
             try:
                 dist = float(decoded.split("Moved")[1].strip().split()[0])
@@ -834,7 +904,6 @@ class motion_controller_plugin(MotionControllerPlugin):
             except:
                 pass
 
-        # Full data string: "Data: Ultrasound 50.0 , IR 1200.0 , Angle 90"
         if "Data:" in decoded:
             try:
                 parts  = decoded.split(",")
@@ -848,7 +917,6 @@ class motion_controller_plugin(MotionControllerPlugin):
             except Exception as pe:
                 self.signals.log_signal.emit(f"Parse err: {pe}", 'warn')
 
-    # ------------------------------------------------------------------
     def disconnect(self):
         self.read_thread_cond = False
         if self.read_thread:
@@ -867,7 +935,6 @@ class motion_controller_plugin(MotionControllerPlugin):
             self.cybot.send((command + "\n").encode('utf-8'))
             self.signals.log_signal.emit(f"TX: {command}", 'cmd')
 
-    # Base class overrides
     def get_channel_names(self):              return super().get_channel_names()
     def get_xaxis_coords(self):               return super().get_xaxis_coords()
     def get_xaxis_units(self):                return super().get_xaxis_units()
@@ -893,7 +960,6 @@ class motion_controller_plugin(MotionControllerPlugin):
             raw_str     = str(int(abs(val)))
             is_negative = val < 0
             if key == 0:
-                # Positive val = rotate left (CCW), negative = rotate right (CW)
                 prefix = "rr" if is_negative else "rl"
             elif key == 1:
                 prefix = "mb" if is_negative else "mf"
@@ -906,17 +972,14 @@ class motion_controller_plugin(MotionControllerPlugin):
             else:                  cmd = '101' + raw_str
             self.send_gcode_command(cmd)
             if prefix in ('mf', 'mb'):
-                # val is in mm from the framework; convert to cm for the minimap
                 dist_cm = (abs(val) / 10.0) * (-1 if is_negative else 1)
                 self.signals.moved_signal.emit(float(dist_cm))
-                # Record for return_to_start replay (store cm, sign preserved)
+                self._last_move_cm = float(dist_cm)
                 self._command_history.append((prefix, int(abs(val) / 10.0) * (1 if not is_negative else -1)))
             elif prefix in ('rl', 'rr'):
                 current = self.command_center.minimap.heading
-                # rl = CW = heading decreases; rr = CCW = heading increases
                 delta   = abs(val) * (1 if prefix == 'rr' else -1)
                 self.signals.position_signal.emit((current + delta) % 360)
-                # Record rotation (degrees, sign preserved: + = rl/CCW, - = rr/CW)
                 self._command_history.append((prefix, int(abs(val)) * (1 if not is_negative else -1)))
 
     def home(self, axes=None):
