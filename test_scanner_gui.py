@@ -1,4 +1,3 @@
-
 ## IMPORTS 
 #region Imports
 import os
@@ -12,7 +11,7 @@ from tkinter import filedialog as fd
 from tkinter import messagebox
 import threading
 from gui.scanner_qt import ScannerQt
-from gui.ui_scanner import Ui_MainWindow
+from gui.ui_scanner import Ui_MainWindow # change to ui_modern for different style
 from gui.qt_util import QPluginSetting
 import gui.select_plot_style as select_plot_style
 import gui.select_plot_hide as select_plot_hide
@@ -39,6 +38,9 @@ from scanner.S_param_visualizer import VisualizerWindow
 from scanner.step_file_importer import ndwindow
 import shutil
 import webbrowser
+from scanner.scan_overlay import ScanOverlay
+from contextlib import contextmanager
+
 #endregion
 
 class MainWindow(QMainWindow):
@@ -46,6 +48,8 @@ class MainWindow(QMainWindow):
     ui: Ui_MainWindow
     pluginChosen_probe = False
     pluginChosen_motion = False
+    pluginChosen_pattern = False
+    pluginChosen_file = False
 
     # Debug mode for testing disk space validation
     # Set to True to simulate low disk space scenarios
@@ -65,6 +69,10 @@ class MainWindow(QMainWindow):
         self.scanner = ScannerQt(signal_scope=self.signal_scope)
         self.plotter = plotter_system()
         self.back_btn_check = False
+        from scanner.plugin_switcher_pattern import PluginSwitcherPattern
+        from scanner.plugin_switcher_file import PluginSwitcherFile
+        from scanner.scan_pattern_1 import ScanPattern
+        from scanner.scan_file_1 import ScanFile
         self.scan_controller = ScanPattern()
         self.file_controller = ScanFile()
         self.motion_config_counter = 0
@@ -73,6 +81,9 @@ class MainWindow(QMainWindow):
         self.setup_theme_toggle()
         self.setup_settings_button()
         self.setup_top_controls()
+        self.scan_overlay = ScanOverlay(self)
+        self.scan_overlay.setGeometry(self.rect())
+        self.scan_overlay.raise_() 
         app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
         try:
             self.setup_plotting_canvas()
@@ -120,8 +131,17 @@ class MainWindow(QMainWindow):
         self.display_timer.start()
     #endregion
     
-    
-    
+    @contextmanager
+    def _busy(self, message="Please wait…"):
+        self.scan_overlay.set_status(message)
+        self.scan_overlay.show()
+        self.scan_overlay.raise_()
+        QApplication.processEvents()
+        try:
+            yield
+        finally:
+            self.scan_overlay.hide()
+            
     ## CONFIG M/P/SP/SF 
     #region config functions
     @Slot(bool)
@@ -192,23 +212,34 @@ class MainWindow(QMainWindow):
     
     @Slot(bool)
     def configure_pattern(self, was_selected: bool) -> None:
-        if was_selected:               
-            
+        if was_selected:
+            from scanner.plugin_switcher_pattern import PluginSwitcherPattern
+
+            if PluginSwitcherPattern.plugin_name == "":
+                # No plugin chosen yet — use the default ScanPattern (scan_pattern_1)
+                # and mark it as chosen so the dialog doesn't re-open next time.
+                # If the user clicks "Change Plugin" later they can pick a different one.
+                pass  # default scan_controller (ScanPattern) already set in __init__
+
             connected = self.scan_controller.is_connected()
             self.set_configuration_setting_pattern(connected)
         else:
             for i in reversed(range(self.ui.config_layout.rowCount())):
                 self.ui.config_layout.removeRow(i)
-
-        
         
 
     @Slot(bool)
     def configure_file(self, was_selected: bool) -> None:
         if was_selected:
+            from scanner.plugin_switcher_file import PluginSwitcherFile
+
+            if PluginSwitcherFile.plugin_name == "":
+                # No plugin chosen yet — use default ScanFile (scan_file_1).
+                # Default is already set in __init__; nothing to swap.
+                pass
+
             connected = self.file_controller.is_connected()
             self.set_configuration_setting_file(connected)
-                
         else:
             for i in reversed(range(self.ui.config_layout.rowCount())):
                 self.ui.config_layout.removeRow(i)
@@ -248,7 +279,12 @@ class MainWindow(QMainWindow):
 
             pause_btn = QPushButton("Pause Scan")
             pause_btn.clicked.connect(self.pause_scan)
-            self.ui.config_layout.addRow(pause_btn)  
+            self.ui.config_layout.addRow(pause_btn)
+
+            # Reset file plugin
+            reset_file_btn = QPushButton("Reset Plugin")
+            reset_file_btn.clicked.connect(self.back_function_file)
+            self.ui.config_layout.addRow(reset_file_btn)
         
         else:
             for i in reversed(range(self.ui.config_layout.rowCount())):
@@ -266,6 +302,13 @@ class MainWindow(QMainWindow):
             camera_pop_up = QPushButton("Camera Pop Up")
             camera_pop_up.clicked.connect(self.camera_pop_up)
             self.ui.config_layout.addRow(camera_pop_up)
+
+            # Change plugin button — only shown once a non-default plugin has been loaded
+            from scanner.plugin_switcher_file import PluginSwitcherFile
+            if PluginSwitcherFile.plugin_name != "":
+                change_file_btn = QPushButton("Change Plugin")
+                change_file_btn.clicked.connect(self.change_file_plugin)
+                self.ui.config_layout.addRow(change_file_btn)
 
             
 
@@ -439,6 +482,11 @@ class MainWindow(QMainWindow):
             estop_butt = QPushButton("E-Stop")
             estop_butt.clicked.connect(self.estop_button)
             self.ui.config_layout.addRow(estop_butt)
+
+            # Reset pattern plugin
+            reset_pat_btn = QPushButton("Reset Plugin")
+            reset_pat_btn.clicked.connect(self.back_function_pattern)
+            self.ui.config_layout.addRow(reset_pat_btn)
             ### TESTING
             self.step_size = self.scan_controller.float_step_size
             self.length = self.scan_controller.y_axis_len
@@ -460,6 +508,13 @@ class MainWindow(QMainWindow):
             back_button = QPushButton("Back")
             back_button.clicked.connect(self.disconnect_pat)
             self.ui.config_layout.addRow(back_button)
+
+            # Change plugin button — only shown once a non-default plugin has been loaded
+            from scanner.plugin_switcher_pattern import PluginSwitcherPattern
+            if PluginSwitcherPattern.plugin_name != "":
+                change_pat_btn = QPushButton("Change Plugin")
+                change_pat_btn.clicked.connect(self.change_pattern_plugin)
+                self.ui.config_layout.addRow(change_pat_btn)
             
             
     #endregion
@@ -471,58 +526,65 @@ class MainWindow(QMainWindow):
     
     ## CONNECT DISCONNECT M/P/SP/SF
     #region c/dc functions
+    
     @Slot()
     def connect_motion(self):
-        # Plugin is already swapped when selected via configure_motion
-        # Just connect to the hardware
-        self.scanner.scanner.motion_controller.connect()
-        self.configure_motion(True)
+        def _do():
+            self.scanner.scanner.motion_controller.connect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_motion(True))
 
     @Slot()
     def disconnect_motion(self):
-        self.scanner.scanner.motion_controller.disconnect()
-        self.configure_motion(True)
+        def _do():
+            self.scanner.scanner.motion_controller.disconnect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_motion(True))
 
     @Slot()
     def connect_probe(self):
-        # Plugin is already swapped when selected via configure_probe
-        # Just connect to the hardware
-        self.scanner.scanner.probe_controller.connect()
-        self.configure_probe(True)
+        def _do():
+            self.scanner.scanner.probe_controller.connect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_probe(True))
 
     @Slot()
     def disconnect_probe(self):
-        self.scanner.scanner.probe_controller.disconnect()
-        self.configure_probe(True)
-        
-    @Slot()
-    def finish_config(self):
-        #connect button for scan file config
-        self.file_controller.connect()
-        self.configure_file(True)
-        
-    @Slot()
-    def go_back_file(self):
+        def _do():
+            self.scanner.scanner.probe_controller.disconnect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_probe(True))
 
-        self.file_controller.disconnect()
-        self.configure_file(True)
-        
     @Slot()
     def connect_pat(self):
-        # Validate memory requirements before connecting
         if not self.validate_scan_memory():
-            # Validation failed - keep in pre-connected state
-            print("Scan pattern connection aborted due to insufficient disk space")
             return
+        def _do():
+            self.scan_controller.connect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_pattern(True))
 
-        # Memory validation passed - proceed with connection
-        self.scan_controller.connect()
-        self.configure_pattern(True)
     @Slot()
     def disconnect_pat(self):
-        self.scan_controller.disconnect()
-        self.configure_pattern(True)    
-        
+        def _do():
+            self.scan_controller.disconnect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_pattern(True))
+
+    @Slot()
+    def finish_config(self):
+        def _do():
+            self.file_controller.connect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_file(True))
+
+    @Slot()
+    def go_back_file(self):
+        def _do():
+            self.file_controller.disconnect()
+        self.scan_overlay.run_blocking(_do, 
+                                    callback=lambda: self.configure_file(True))
+                
     #endregion
     
     
@@ -938,6 +1000,63 @@ class MainWindow(QMainWindow):
             # Reset state and refresh UI
             self.pluginChosen_motion = False
             self.configure_motion(True)
+
+    def change_pattern_plugin(self):
+        """Allow user to select a different scan pattern plugin."""
+        from scanner.plugin_switcher_pattern import PluginSwitcherPattern
+
+        if PluginSwitcherPattern.select_plugin():
+            # Disconnect old controller, replace with newly selected plugin
+            self.scan_controller.disconnect()
+            self.scan_controller = PluginSwitcherPattern._load_selected()
+            self.pluginChosen_pattern = True
+            self.configure_pattern(True)
+
+    def change_file_plugin(self):
+        """Allow user to select a different scan file plugin."""
+        from scanner.plugin_switcher_file import PluginSwitcherFile
+
+        if PluginSwitcherFile.select_plugin():
+            self.file_controller.disconnect()
+            self.file_controller = PluginSwitcherFile._load_selected()
+            self.pluginChosen_file = True
+            self.configure_file(True)
+
+    def back_function_pattern(self):
+        """Reset scan pattern plugin to default (scan_pattern_1)."""
+        from tkinter import messagebox
+        response = messagebox.askyesno(
+            "Reset Scan Pattern Plugin",
+            "Are you sure you want to reset the scan pattern plugin?\n"
+            "This will disconnect and return to the default pattern."
+        )
+        if response:
+            from scanner.plugin_switcher_pattern import PluginSwitcherPattern
+            from scanner.scan_pattern_1 import ScanPattern
+            PluginSwitcherPattern.plugin_name = ""
+            PluginSwitcherPattern.basename = ""
+            self.scan_controller.disconnect()
+            self.scan_controller = ScanPattern()
+            self.pluginChosen_pattern = False
+            self.configure_pattern(True)
+
+    def back_function_file(self):
+        """Reset scan file plugin to default (scan_file_1)."""
+        from tkinter import messagebox
+        response = messagebox.askyesno(
+            "Reset Scan File Plugin",
+            "Are you sure you want to reset the scan file plugin?\n"
+            "This will disconnect and return to the default file handler."
+        )
+        if response:
+            from scanner.plugin_switcher_file import PluginSwitcherFile
+            from scanner.scan_file_1 import ScanFile
+            PluginSwitcherFile.plugin_name = ""
+            PluginSwitcherFile.basename = ""
+            self.file_controller.disconnect()
+            self.file_controller = ScanFile()
+            self.pluginChosen_file = False
+            self.configure_file(True)
     
     def setup_theme_toggle(self):
         self.theme_btn = QToolButton(self)
@@ -960,10 +1079,12 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(qdarktheme.load_stylesheet("light"))
             self.current_theme = "light"
             self.theme_btn.setText("☀️")
+            self.scan_overlay.set_theme("light")
         else:
             app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
             self.current_theme = "dark"
             self.theme_btn.setText("🌙")
+            self.scan_overlay.set_theme("dark")
 
     def setup_settings_button(self):
         self.settings_btn = QToolButton(self)
@@ -1041,10 +1162,25 @@ class MainWindow(QMainWindow):
 
         self.top_controls.adjustSize()
         self.top_controls.raise_()
+        
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self.scan_overlay.hide()
+            elif self._worker_active():  # only re-show if a job is running
+                self.scan_overlay.show()
+                self.scan_overlay.raise_()
+
+    def _worker_active(self):
+        return self.scan_overlay._worker is not None and self.scan_overlay._worker.isRunning()
     def resizeEvent(self, event):
         super().resizeEvent(event)
         margin = 8
         self.top_controls.move(margin, margin)
+        self.scan_overlay.move(0, 0)                    # add these two
+        self.scan_overlay.resize(self.size())           # lines
 
     def setup_plotting_canvas(self) -> None:
        # main_layout = self.ui.main_layout 
@@ -1052,6 +1188,7 @@ class MainWindow(QMainWindow):
         # main_layout.addWidget(self.plotter, 1, 5)
         pass
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.scan_overlay.cleanup()
         self.scanner.close()
         return super().closeEvent(event)
     #endregion 

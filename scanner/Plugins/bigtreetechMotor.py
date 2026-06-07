@@ -354,6 +354,7 @@ class motion_controller_plugin(MotionControllerPlugin):
         Returns:
             Dictionary of homed positions
         """
+        # Uncomment back after done testing
         if axes is None:
             axes = [0, 1, 2]  # Home all axes by default
 
@@ -365,7 +366,7 @@ class motion_controller_plugin(MotionControllerPlugin):
         while movement[0] == True:
             movement = self.is_moving()
 
-        # Set initial position based on scanner type
+        # # Set initial position based on scanner type
         scanner_type_str = self.scanner_type.value
         if scanner_type_str == "N-d Scanner":
             # N-d Scanner: Z starts at 300 mm (top of cube)
@@ -390,3 +391,5 @@ class motion_controller_plugin(MotionControllerPlugin):
 
 
         return {axis: self.current_position[axis] for axis in axes}
+    def show_radar(self):
+        return super().show_radar() 
